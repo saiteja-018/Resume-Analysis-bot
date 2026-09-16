@@ -146,3 +146,63 @@ def status_emoji(status: str) -> str:
         "unclear": "❓",
     }
     return mapping.get(status.lower(), "⚪")
+
+
+def is_job_description_doc(filename: str, text: str) -> bool:
+    """
+    Determine whether an uploaded document (docx or pdf) is a Job Description
+    based on filename hints and text content patterns.
+    """
+    lower_name = (filename or "").lower()
+
+    # 1. Strong filename indicators
+    jd_filename_tokens = [
+        "jd", "job_description", "job-description", "jobdescription", "job description",
+        "job_spec", "job-spec", "jobspec", "job spec",
+        "job_posting", "job-posting", "jobposting", "job posting",
+        "role_description", "role-description", "roledescription", "role description",
+        "position_description", "position-description",
+        "job_profile", "job-profile", "job profile",
+        "job_details", "job-details", "job details",
+        "vacancy", "hiring", "job_requirement", "job_requirements"
+    ]
+    for token in jd_filename_tokens:
+        if re.search(r'(^|[_\-\s\.\(\[\d])' + re.escape(token) + r'([_\-\s\.\)\]\d]|$)', lower_name):
+            return True
+
+    # 2. Content-based classification
+    lower_text = (text or "").lower()
+    if len(lower_text) < 50:
+        return False
+
+    jd_keywords = [
+        "job description", "job title", "about the job", "about the role",
+        "role overview", "position overview", "job summary", "role summary",
+        "responsibilities", "key responsibilities", "core responsibilities",
+        "what you'll do", "what you will do", "what you bring", "who you are",
+        "requirements", "minimum requirements", "basic requirements", "key requirements",
+        "qualifications", "minimum qualifications", "preferred qualifications",
+        "desired qualifications", "must have", "nice to have", "good to have",
+        "what we offer", "what we're looking for", "what we are looking for",
+        "about us", "who we are", "why join us", "benefits & perks", "benefits:",
+        "compensation", "salary range", "equal opportunity employer",
+        "reporting to", "location:", "employment type", "full-time", "part-time"
+    ]
+
+    resume_keywords = [
+        "curriculum vitae", "resume", "work experience", "professional experience",
+        "employment history", "education", "b.tech", "b.e.", "bachelor of",
+        "master of", "gpa", "cgpa", "academic background", "personal projects",
+        "technical skills", "skills summary", "certifications", "achievements",
+        "career objective", "personal profile", "declaration", "my experience"
+    ]
+
+    jd_score = sum(1 for kw in jd_keywords if kw in lower_text)
+    resume_score = sum(1 for kw in resume_keywords if kw in lower_text)
+
+    if jd_score >= 3 and jd_score > resume_score:
+        return True
+    if jd_score >= 2 and any(term in lower_name for term in ("job", "role", "spec", "req", "desc", "position")):
+        return True
+
+    return False

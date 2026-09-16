@@ -17,7 +17,7 @@ class RateLimiter:
     Tracks analysis requests per user_id within a rolling time window.
     """
 
-    def __init__(self, max_requests: int = 5, window_seconds: int = 3600):
+    def __init__(self, max_requests: int = 2, window_seconds: int = 60):
         """
         Args:
             max_requests: Maximum analyses allowed per window.
@@ -64,4 +64,4 @@ class RateLimiter:
 
 
 # Global rate limiter instance — 5 analyses per hour per user
-rate_limiter = RateLimiter(max_requests=5, window_seconds=3600)
+rate_limiter = RateLimiter(max_requests=2, window_seconds=60)

@@ -38,7 +38,7 @@ from prompts import SYSTEM_PROMPT, build_user_message
 from ai_engine import analyze
 from response_formatter import format_response, get_page_footer, split_into_pages
 from rate_limiter import rate_limiter
-from utils import truncate_text
+from utils import truncate_text, format_score_bar, score_emoji, priority_emoji, is_job_description_doc
 
 # =============================================================================
 # Logging
@@ -94,6 +94,110 @@ def _get_greeting_response(text: str) -> str | None:
             return GREETING_RESPONSES["bye"]
         return GREETING_RESPONSES["default"]
     return None
+
+
+SCORE_QUERY_PATTERNS = re.compile(
+    r"^\s*(what('?s|\s+is)\s+)?(my\s+)?(ats\s+)?score\??\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_score_query(text: str) -> bool:
+    """Check if the user is simply requesting their current ATS score."""
+    clean = text.strip().lower()
+    return bool(
+        SCORE_QUERY_PATTERNS.match(clean)
+        or clean in ("score", "my score", "ats score", "current score", "show score")
+    )
+
+
+COMMON_VALID_WORDS = {
+    "a", "an", "the", "in", "on", "at", "to", "for", "of", "with", "by", "from",
+    "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did",
+    "can", "could", "should", "would", "will", "may", "might", "must",
+    "i", "my", "me", "we", "our", "you", "your", "he", "she", "it", "they", "them",
+    "what", "why", "how", "when", "where", "who", "which",
+    "score", "resume", "cv", "job", "jd", "role", "work", "skills", "projects",
+    "experience", "help", "review", "analyze", "compare", "improve", "learn",
+    "python", "java", "sql", "aws", "react", "node", "docker", "tech", "dev", "data",
+}
+
+
+def _is_meaningful_text(text: str) -> bool:
+    """
+    Validate that user text is not random keyboard smash (e.g. 'wekhsekfdn skdfn skdj fskd').
+    Always allows genuine text, technical acronyms, and long documents.
+    """
+    cleaned = text.strip()
+    if len(cleaned) < 2:
+        return False
+
+    # Any text with 40+ chars and spaces is treated as genuine (e.g. pasted JD or resume)
+    if len(cleaned) >= 40 and " " in cleaned:
+        if not re.search(r'(.)\1{8,}', cleaned):
+            return True
+
+    words = [w.lower().strip(".,!?;:\"'()[]{}/*-_") for w in cleaned.split()]
+    words = [w for w in words if w]
+    if not words:
+        return False
+
+    # If any known valid word is present, it's meaningful
+    if any(w in COMMON_VALID_WORDS for w in words):
+        return True
+
+    # Check for excessive single-character repetition
+    if re.search(r'(.)\1{4,}', cleaned):
+        return False
+
+    # Check vowel ratio for text with >= 8 letters total
+    vowels = set("aeiouy")
+    total_letters = sum(len([c for c in w if c.isalpha()]) for w in words)
+    total_vowels = sum(1 for c in cleaned.lower() if c in vowels)
+    if total_letters >= 8 and (total_vowels / total_letters) < 0.15:
+        return False
+
+    return True
+
+
+def _build_quick_score_card(session) -> str:
+    """Build a quick, instant reminder card of the candidate's last ATS score."""
+    ats = session.last_analysis.get("ats", {}) if session.last_analysis else {}
+    overall = ats.get("overall_score", 0)
+    interpretation = ats.get("interpretation", "")
+    categories = ats.get("category_scores", {})
+
+    lines = [
+        "📊  YOUR LATEST ATS SCORE",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"  {score_emoji(overall)}  Overall Score:  {overall} / 100",
+        f"  {format_score_bar(overall, bar_length=15)}",
+        "",
+    ]
+    if interpretation:
+        lines.append(f"  📝  {interpretation}")
+        lines.append("")
+
+    if categories:
+        lines.append("📈  SCORE BREAKDOWN")
+        lines.append("─" * 28)
+        cat_config = [
+            ("required_skill_match", "Required Skills"),
+            ("keyword_match", "Keywords"),
+            ("experience_project_relevance", "Experience/Projects"),
+            ("education_certification_match", "Education/Certs"),
+            ("ats_readability", "ATS Readability"),
+            ("achievement_impact", "Impact & Outcomes"),
+        ]
+        for key, label in cat_config:
+            score = categories.get(key, 0)
+            lines.append(f"  • {label:<22} {score:>3}/100")
+        lines.append("")
+
+    lines.append("👇  Tap below to learn how to boost your score or prep for interviews!")
+    return "\n".join(lines)
+
 
 
 # =============================================================================
@@ -210,13 +314,30 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     session = sessions.get(user_id)
+
+    if session.resume_count() >= 2:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔄 Compare All ({session.resume_count()}) Resumes", callback_data="compare_multi_now")],
+            [InlineKeyboardButton("📝 Match with 1 JD", callback_data="auto_add_jd")],
+            [InlineKeyboardButton("🔄 Clear & Start Fresh", callback_data="clear_resumes")],
+        ])
+        await update.message.reply_text(
+            f"📂  You have {session.resume_count()} resumes loaded:\n"
+            + "\n".join([f"  • 📄 {r.name}" for r in session.resumes]) + "\n\n"
+            "Choose an option below, or send another resume to add more candidates:",
+            reply_markup=keyboard,
+        )
+        return
+
     session.reset()
     session.mode = SessionMode.COMPARE
     session.state = SessionState.WAITING_RESUME
 
     await update.message.reply_text(
-        "🔄  Resume Comparison\n\n"
-        "📎  Please send me Resume A (PDF or DOCX)."
+        "🔄  Multiple Resume Comparison\n\n"
+        "📎  Send your resumes one by one (PDF or DOCX).\n\n"
+        "💡  You can send 2, 3, 4, or more resumes to compare them side-by-side, "
+        "or paste 1 Job Description to rank all candidates against that role!"
     )
 
 
@@ -229,7 +350,7 @@ async def cmd_jd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "📋  Job Description Analysis\n\n"
-        "📝  Please paste the job description text."
+        "📝  Please send a JD file (DOCX or PDF), or paste the job description text."
     )
 
 
@@ -268,17 +389,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     session = sessions.get(user_id)
 
-    if session.state not in (SessionState.WAITING_RESUME, SessionState.WAITING_RESUME_B):
-        await update.message.reply_text(
-            "🤔  I wasn't expecting a document right now.\n\n"
-            "Start with a command:\n"
-            "  📊 /analyze   📝 /review   🔄 /compare"
-        )
-        return
-
     document = update.message.document
     mime_type = document.mime_type or ""
     file_type = SUPPORTED_MIME_TYPES.get(mime_type)
+
+    # Fallback to extension check if mime_type is generic
+    if not file_type and document.file_name:
+        fname = document.file_name.lower()
+        if fname.endswith(".pdf"):
+            file_type = "pdf"
+        elif fname.endswith(".docx"):
+            file_type = "docx"
 
     if not file_type:
         await update.message.reply_text(
@@ -301,18 +422,174 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         file = await document.get_file()
         temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, f"resume.{file_type}")
+        temp_path = os.path.join(temp_dir, f"doc.{file_type}")
         await file.download_to_drive(temp_path)
 
-        text = extract_text(temp_path, file_type)
-        text = truncate_text(text, MAX_RESUME_LENGTH)
+        raw_text = extract_text(temp_path, file_type)
+        file_display_name = document.file_name or f"Document.{file_type}"
 
-        if session.state == SessionState.WAITING_RESUME:
-            session.resume_a_text = text
-            await _on_resume_a_received(update, context, session, processing_msg)
-        elif session.state == SessionState.WAITING_RESUME_B:
-            session.resume_b_text = text
-            await _on_resume_b_received(update, context, session, processing_msg)
+        # ── Check if this document is a Job Description ──
+        # It is a JD if:
+        # 1. User explicitly requested JD analysis (/jd or JD_ONLY mode)
+        # 2. Bot is waiting for a JD (WAITING_JD state)
+        # 3. Filename or text patterns indicate it is a Job Description
+        is_jd = (
+            session.mode == SessionMode.JD_ONLY
+            or session.state == SessionState.WAITING_JD
+            or is_job_description_doc(file_display_name, raw_text)
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PATH A: Document is a Job Description (.docx or .pdf)
+        # ══════════════════════════════════════════════════════════════════════
+        if is_jd:
+            session.jd_text = truncate_text(raw_text, MAX_JD_LENGTH)
+
+            # Case A1: User is in JD_ONLY mode (e.g. /jd command)
+            if session.mode == SessionMode.JD_ONLY:
+                session.state = SessionState.ANALYZING
+                await processing_msg.edit_text(
+                    f"📋  Job description received from {file_display_name}!  ({len(session.jd_text)} chars)\n\n"
+                    "⏳  Analyzing the job description..."
+                )
+                await _run_analysis(update, context, session)
+                return
+
+            # Case A2: User already has candidate resume(s) loaded!
+            if session.has_resume():
+                session.state = SessionState.ANALYZING
+                total_resumes = session.resume_count()
+                if total_resumes >= 2:
+                    session.mode = SessionMode.COMPARE
+                    names = ", ".join(r.name for r in session.resumes)
+                    await processing_msg.edit_text(
+                        f"📋  Job description received from {file_display_name}!  ({len(session.jd_text)} chars)\n\n"
+                        f"👥  Ranking all {total_resumes} candidates ({names}) against this role...\n\n"
+                        "⏳  Scoring match %, identifying skill gaps, and generating recommendations..."
+                    )
+                else:
+                    session.mode = SessionMode.ANALYZE
+                    r_name = session.resumes[0].name
+                    await processing_msg.edit_text(
+                        f"📋  Job description received from {file_display_name}!  ({len(session.jd_text)} chars)\n\n"
+                        f"⏳  Matching resume '{r_name}' against this job description..."
+                    )
+                await _run_analysis(update, context, session)
+                return
+
+            # Case A3: No resumes loaded yet — user sent JD file first!
+            session.mode = SessionMode.ANALYZE
+            session.state = SessionState.WAITING_RESUME
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋  Analyze this JD Only", callback_data="auto_analyze_jd_now")],
+                [InlineKeyboardButton("📎  Send Candidate Resume", callback_data="prompt_add_resume")],
+                [InlineKeyboardButton("🔄  Clear", callback_data="clear_resumes")],
+            ])
+            await processing_msg.edit_text(
+                f"📋  Job description received from {file_display_name}!  ({len(session.jd_text)} chars)\n\n"
+                "Next steps:\n"
+                "  • 📎 Send candidate resume file(s) (PDF or DOCX) to match against this job\n"
+                "  • ⚡ Or tap below to analyze this Job Description directly:",
+                reply_markup=keyboard,
+            )
+            return
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PATH B: Document is a Candidate Resume (.docx or .pdf)
+        # ══════════════════════════════════════════════════════════════════════
+        text = truncate_text(raw_text, MAX_RESUME_LENGTH)
+        session.add_resume(text, filename=file_display_name)
+        total_resumes = session.resume_count()
+
+        # Build formatted list of loaded candidates
+        pool_lines = [f"  • 📄 #{r.index}: {r.name} ({len(r.text)} chars)" for r in session.resumes]
+        pool_summary = "\n".join(pool_lines)
+
+        # ── Case B1: First Resume Added ──
+        if total_resumes == 1:
+            # If a JD was already uploaded earlier, analyze immediately!
+            if session.has_jd():
+                session.mode = SessionMode.ANALYZE
+                session.state = SessionState.ANALYZING
+                await processing_msg.edit_text(
+                    f"✅  Resume received: {file_display_name}  ({len(text)} chars)\n\n"
+                    "⏳  Matching your resume against the uploaded job description..."
+                )
+                await _run_analysis(update, context, session)
+                return
+
+            if session.mode == SessionMode.REVIEW:
+                session.state = SessionState.ANALYZING
+                await processing_msg.edit_text(
+                    f"✅  Resume received: {file_display_name}  ({len(text)} chars)\n\n"
+                    "⏳  Reviewing resume quality & structure..."
+                )
+                await _run_analysis(update, context, session)
+                return
+
+            if session.mode == SessionMode.ANALYZE:
+                session.state = SessionState.WAITING_JD
+                await processing_msg.edit_text(
+                    f"✅  Resume 1 received: {file_display_name}  ({len(text)} chars)\n\n"
+                    "📝  Now please send or paste the Job Description (.docx, .pdf, or text) to match against."
+                )
+                return
+
+            # Default / auto routing:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📝 Review Quality", callback_data="auto_review_now"),
+                    InlineKeyboardButton("📊 Match with JD", callback_data="auto_add_jd"),
+                ],
+                [
+                    InlineKeyboardButton("📎 Add 2nd Resume", callback_data="prompt_add_resume"),
+                    InlineKeyboardButton("🔄 Clear", callback_data="clear_resumes"),
+                ],
+            ])
+
+            await processing_msg.edit_text(
+                f"✅  Resume 1 loaded: {file_display_name}  ({len(text)} chars)\n\n"
+                f"📂  Candidate Pool (1 resume):\n"
+                f"{pool_summary}\n\n"
+                "Next steps:\n"
+                "  • 📎 Send another resume to compare candidates\n"
+                "  • 📝 Send or paste a Job Description (.docx, .pdf, or text) to match\n"
+                "  • ⚡ Or choose an option below:",
+                reply_markup=keyboard,
+            )
+
+        # ── Case B2: Multiple Resumes Added (2, 3, 4, 5...) ──
+        else:
+            buttons = []
+            if session.has_jd():
+                buttons.append([
+                    InlineKeyboardButton(f"🏆 Rank All ({total_resumes}) vs JD", callback_data="compare_multi_now")
+                ])
+                buttons.append([
+                    InlineKeyboardButton("📎 Add More", callback_data="prompt_add_resume"),
+                    InlineKeyboardButton("🔄 Clear Pool", callback_data="clear_resumes"),
+                ])
+            else:
+                buttons.append([
+                    InlineKeyboardButton(f"🔄 Compare All ({total_resumes}) Resumes", callback_data="compare_multi_now"),
+                    InlineKeyboardButton("📝 Send / Paste JD", callback_data="auto_add_jd"),
+                ])
+                buttons.append([
+                    InlineKeyboardButton("📎 Add More", callback_data="prompt_add_resume"),
+                    InlineKeyboardButton("🔄 Clear Pool", callback_data="clear_resumes"),
+                ])
+
+            keyboard = InlineKeyboardMarkup(buttons)
+            await processing_msg.edit_text(
+                f"✅  Resume {total_resumes} loaded: {file_display_name}  ({len(text)} chars)\n\n"
+                f"📂  Candidate Pool ({total_resumes} resumes loaded):\n"
+                f"{pool_summary}\n\n"
+                f"Ready to compare or match!\n"
+                f"  • 📎 Send another resume to add more candidates\n"
+                f"  • 📝 Send or paste a Job Description (.docx, .pdf, or text) to rank all {total_resumes} candidates\n"
+                f"  • ⚡ Or tap below to compare now:",
+                reply_markup=keyboard,
+            )
 
     except ValueError as e:
         await processing_msg.edit_text(f"❌  {str(e)}")
@@ -331,50 +608,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 pass
 
 
-async def _on_resume_a_received(update, context, session, processing_msg):
-    chars = len(session.resume_a_text)
-
-    if session.mode == SessionMode.ANALYZE:
-        session.state = SessionState.WAITING_JD
-        await processing_msg.edit_text(
-            f"✅  Resume received!  ({chars} chars extracted)\n\n"
-            "📝  Now paste the job description text."
-        )
-
-    elif session.mode == SessionMode.REVIEW:
-        await processing_msg.edit_text(
-            f"✅  Resume received!  ({chars} chars)\n\n"
-            "⏳  Analyzing your resume..."
-        )
-        await _run_analysis(update, context, session)
-
-    elif session.mode == SessionMode.COMPARE:
-        session.state = SessionState.WAITING_RESUME_B
-        await processing_msg.edit_text(
-            f"✅  Resume A received!  ({chars} chars)\n\n"
-            "📎  Now send me Resume B (PDF or DOCX)."
-        )
-
-
-async def _on_resume_b_received(update, context, session, processing_msg):
-    chars = len(session.resume_b_text)
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📝 Add Job Description", callback_data="compare_add_jd"),
-            InlineKeyboardButton("⚡ Compare Now", callback_data="compare_now"),
-        ]
-    ])
-
-    session.state = SessionState.IDLE
-    await processing_msg.edit_text(
-        f"✅  Resume B received!  ({chars} chars)\n\n"
-        "Add a job description for a targeted comparison,\n"
-        "or compare directly?",
-        reply_markup=keyboard,
-    )
-
-
 # =============================================================================
 # Text Message Handler
 # =============================================================================
@@ -387,54 +620,243 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
 
-    # ── Check for greetings / generic messages ──
-    if session.state == SessionState.IDLE and not session.has_previous_analysis():
-        greeting = _get_greeting_response(text)
-        if greeting:
-            await update.message.reply_text(greeting)
+    # 1. Check for score inquiries ("score", "my score", "what is my score")
+    if _is_score_query(text):
+        if session.has_previous_analysis():
+            score_card = _build_quick_score_card(session)
+            buttons = [
+                [
+                    InlineKeyboardButton("💡  How to Boost Score?", callback_data="quick_improve"),
+                    InlineKeyboardButton("🎯  Interview Questions", callback_data="quick_interview"),
+                ],
+                [
+                    InlineKeyboardButton("🎓  Courses & Links", callback_data="show_courses"),
+                    InlineKeyboardButton("🔄  New Analysis", callback_data="new_analysis_prompt"),
+                ],
+            ]
+            await update.message.reply_text(score_card, reply_markup=InlineKeyboardMarkup(buttons))
             return
-
-    # ── Waiting for JD ──
-    if session.state == SessionState.WAITING_JD:
-        session.jd_text = truncate_text(text, MAX_JD_LENGTH)
-
-        if session.mode == SessionMode.JD_ONLY:
-            await update.message.reply_text("⏳  Analyzing the job description...")
-            await _run_analysis(update, context, session)
-        elif session.mode in (SessionMode.ANALYZE, SessionMode.COMPARE):
+        else:
             await update.message.reply_text(
-                f"✅  Job description received!  ({len(session.jd_text)} chars)\n\n"
-                "⏳  Analyzing..."
+                "📊  No active ATS score found!\n\n"
+                "To get an ATS score and match analysis:\n"
+                "  📊  /analyze  — Compare resume with a Job Description\n"
+                "  📝  /review   — Review resume quality & structure\n\n"
+                "Or simply send your resume file (PDF/DOCX) or paste it to start!"
             )
-            await _run_analysis(update, context, session)
-        return
-
-    # ── Follow-up question on previous analysis ──
-    if session.has_previous_analysis():
-        # Check for greetings even with previous analysis
-        greeting = _get_greeting_response(text)
-        if greeting:
-            await update.message.reply_text(greeting)
             return
 
-        await update.message.reply_text("⏳  Thinking about your question...")
-        await _run_follow_up(update, context, session, text)
-        return
-
-    # ── No context ──
+    # 2. Check for greetings / polite chat
     greeting = _get_greeting_response(text)
     if greeting:
         await update.message.reply_text(greeting)
         return
 
+    # 3. Check for meaningless text / keyboard smash (e.g. 'wekhsekfdn skdfn skdj fskd')
+    if not _is_meaningful_text(text):
+        if session.has_previous_analysis():
+            await update.message.reply_text(
+                "⚠️  I didn't quite understand that message.\n\n"
+                "Please ask a specific question about your resume, or choose an option below:",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("💡  How to Boost Score?", callback_data="quick_improve"),
+                        InlineKeyboardButton("🎯  Interview Questions", callback_data="quick_interview"),
+                    ],
+                    [
+                        InlineKeyboardButton("🎓  Courses & Links", callback_data="show_courses"),
+                        InlineKeyboardButton("🔄  New Analysis", callback_data="new_analysis_prompt"),
+                    ],
+                ]),
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️  I didn't quite understand that message.\n\n"
+                "Start with one of the options below:\n"
+                "  📊  /analyze  — Match resume to a job description\n"
+                "  📝  /review   — Check resume quality\n"
+                "  🔄  /compare  — Compare two resumes\n"
+                "  📋  /jd       — Analyze a job description\n\n"
+                "Or simply send a resume file (PDF or DOCX) to begin!"
+            )
+        return
+
+    # 4. User ALREADY has resume(s) loaded and pastes text -> Treat as Job Description!
+    if session.has_resume() and not session.has_previous_analysis():
+        session.jd_text = truncate_text(text, MAX_JD_LENGTH)
+        session.state = SessionState.ANALYZING
+        resumes_count = session.resume_count()
+        if resumes_count >= 2:
+            session.mode = SessionMode.COMPARE
+            names = ", ".join(r.name for r in session.resumes)
+            await update.message.reply_text(
+                f"✅  Job description received!  ({len(session.jd_text)} chars)\n\n"
+                f"👥  Ranking all {resumes_count} candidates ({names}) against this job description...\n\n"
+                "⏳  Evaluating match %, ranking candidates, and analyzing skill gaps..."
+            )
+        else:
+            session.mode = SessionMode.ANALYZE
+            await update.message.reply_text(
+                f"✅  Job description received!  ({len(session.jd_text)} chars)\n\n"
+                "⏳  Matching your resume against this job description..."
+            )
+        await _run_analysis(update, context, session)
+        return
+
+    # 5. Waiting for Job Description (e.g. after /analyze or /jd command)
+    if session.state == SessionState.WAITING_JD:
+        session.jd_text = truncate_text(text, MAX_JD_LENGTH)
+        session.state = SessionState.ANALYZING
+        if session.resume_count() >= 2:
+            session.mode = SessionMode.COMPARE
+            names = ", ".join(r.name for r in session.resumes)
+            await update.message.reply_text(
+                f"✅  Job description received!  ({len(session.jd_text)} chars)\n\n"
+                f"👥  Ranking {session.resume_count()} candidates ({names}) against this job description...\n\n"
+                "⏳  Evaluating match %, ranking candidates, and analyzing skill gaps..."
+            )
+            await _run_analysis(update, context, session)
+        elif session.mode == SessionMode.JD_ONLY:
+            await update.message.reply_text("⏳  Analyzing the job description...")
+            await _run_analysis(update, context, session)
+        else:
+            await update.message.reply_text(
+                f"✅  Job description received!  ({len(session.jd_text)} chars)\n\n"
+                "⏳  Analyzing match with your resume..."
+            )
+            await _run_analysis(update, context, session)
+        return
+
+    # 6. Previous analysis exists:
+    if session.has_previous_analysis():
+        lower_text = text.lower()
+        # If user pastes a new job description (> 120 chars with requirements/skills), analyze it!
+        if len(text) > 120 and any(
+            k in lower_text
+            for k in (
+                "requirement", "responsibilit", "qualification", "looking for",
+                "skills", "experience", "developer", "engineer", "role", "job", "we need"
+            )
+        ):
+            session.jd_text = truncate_text(text, MAX_JD_LENGTH)
+            session.state = SessionState.ANALYZING
+            resumes_count = session.resume_count()
+            if resumes_count >= 2:
+                session.mode = SessionMode.COMPARE
+                names = ", ".join(r.name for r in session.resumes)
+                await update.message.reply_text(
+                    f"📋  New Job Description detected!  ({len(session.jd_text)} chars)\n\n"
+                    f"👥  Re-ranking {resumes_count} candidates ({names}) against this new role...\n\n"
+                    "⏳  Analyzing match..."
+                )
+            else:
+                session.mode = SessionMode.ANALYZE
+                await update.message.reply_text(
+                    f"📋  New Job Description detected!  ({len(session.jd_text)} chars)\n\n"
+                    "⏳  Matching your resume against this new role..."
+                )
+            await _run_analysis(update, context, session)
+            return
+
+        # Otherwise, treat as follow-up question
+        await update.message.reply_text("⏳  Thinking about your question with career coach depth...")
+        await _run_follow_up(update, context, session, text)
+        return
+
+    # 7. No resume loaded yet — Smart auto-detection of text type:
+    lower_text = text.lower()
+    is_jd = len(text) >= 80 and any(
+        k in lower_text
+        for k in (
+            "requirement", "responsibilit", "qualification", "looking for",
+            "we need", "must have", "years of experience", "job description", "salary"
+        )
+    )
+    is_resume = len(text) >= 80 and any(
+        k in lower_text
+        for k in (
+            "education", "experience", "work history", "curriculum vitae",
+            "projects", "certifications", "skills:", "gpa", "b.tech", "b.e"
+        )
+    )
+
+    if is_jd:
+        session.jd_text = truncate_text(text, MAX_JD_LENGTH)
+        session.mode = SessionMode.ANALYZE
+        session.state = SessionState.WAITING_RESUME
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋  Analyze this JD Only", callback_data="auto_analyze_jd_now")]
+        ])
+        await update.message.reply_text(
+            f"📋  Job description received!  ({len(session.jd_text)} chars)\n\n"
+            "📎  Now send your resume file (PDF or DOCX) to match against this job,\n"
+            "⚡  or tap below to analyze this job description directly.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if is_resume:
+        session.add_resume(truncate_text(text, MAX_RESUME_LENGTH), filename=f"Resume_{session.resume_count() + 1}")
+        total = session.resume_count()
+        if total >= 2:
+            pool_lines = [f"  • 📄 #{r.index}: {r.name} ({len(r.text)} chars)" for r in session.resumes]
+            pool_summary = "\n".join(pool_lines)
+            buttons = [
+                [
+                    InlineKeyboardButton(f"🔄 Compare All ({total}) Resumes", callback_data="compare_multi_now"),
+                    InlineKeyboardButton("📝 Paste JD", callback_data="auto_add_jd"),
+                ],
+                [
+                    InlineKeyboardButton("📎 Add More", callback_data="prompt_add_resume"),
+                    InlineKeyboardButton("🔄 Clear Pool", callback_data="clear_resumes"),
+                ],
+            ]
+            await update.message.reply_text(
+                f"✅  Resume {total} loaded from text!  ({len(text)} chars)\n\n"
+                f"📂  Candidate Pool ({total} resumes loaded):\n"
+                f"{pool_summary}\n\n"
+                "Ready to compare or match!\n"
+                "  • 📎 Send/paste another resume to add more\n"
+                "  • 📝 Paste a Job Description to rank all candidates against 1 JD\n"
+                "  • ⚡ Or tap below to compare now:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+        else:
+            session.mode = SessionMode.ANALYZE
+            session.state = SessionState.WAITING_JD
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝  Review Resume Quality", callback_data="auto_review_now")],
+                [InlineKeyboardButton("📎  Add 2nd Resume", callback_data="prompt_add_resume")],
+            ])
+            await update.message.reply_text(
+                f"📄  Resume text received!  ({len(session.resumes[0].text)} chars)\n\n"
+                "Next steps:\n"
+                "  • 📝 Paste a Job Description to match against your resume\n"
+                "  • 📎 Send/paste another resume to compare candidates\n"
+                "  • ⚡ Or tap below to review this resume now:",
+                reply_markup=keyboard,
+            )
+            return
+
+    # 8. If text looks like a question or advice query, answer it directly!
+    if any(q in lower_text for q in ("how", "what", "why", "can", "should", "tell", "explain", "tips", "advice", "help")):
+        await update.message.reply_text("⏳  Thinking about your question with career coach depth...")
+        await _run_follow_up(update, context, session, text)
+        return
+
+    # 9. Fallback guidance
     await update.message.reply_text(
-        "🤔  I need more context to help you.\n\n"
-        "Start with a command:\n"
+        "🤔  I received your message!\n\n"
+        "Here are the best ways to use CareerMatch AI:\n"
+        "  📎  Upload your resume (PDF or DOCX)\n"
+        "  📝  Paste a Job Description text to match\n"
+        "  💬  Ask any career or interview question\n\n"
+        "Or use a command:\n"
         "  📊 /analyze  — Resume vs JD\n"
         "  📝 /review   — Resume review\n"
         "  🔄 /compare  — Compare resumes\n"
-        "  📋 /jd       — JD analysis\n\n"
-        "Or send /help for the full guide."
+        "  📋 /jd       — JD analysis"
     )
 
 
@@ -450,19 +872,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     session = sessions.get(user_id)
     data = query.data
 
+    # ── Auto document quick actions ──
+    if data == "auto_review_now":
+        session.mode = SessionMode.REVIEW
+        session.state = SessionState.ANALYZING
+        await query.edit_message_text("⏳  Analyzing your resume...")
+        await _run_analysis_from_callback(query, context, session)
+        return
+
+    if data == "auto_analyze_jd_now":
+        session.mode = SessionMode.JD_ONLY
+        session.state = SessionState.ANALYZING
+        await query.edit_message_text("⏳  Analyzing the job description...")
+        await _run_analysis_from_callback(query, context, session)
+        return
+
+    if data == "auto_add_jd":
+        session.mode = SessionMode.ANALYZE
+        session.state = SessionState.WAITING_JD
+        await query.edit_message_text(
+            "📝  Please send a Job Description file (.docx or .pdf),\n"
+            "or paste the job description text to match against your resume."
+        )
+        return
+
     # ── Compare: add JD ──
     if data == "compare_add_jd":
         session.state = SessionState.WAITING_JD
         await query.edit_message_text(
-            "📝  Please paste the job description text\n"
-            "for a targeted comparison."
+            "📝  Please send a Job Description file (.docx or .pdf),\n"
+            "or paste the job description text for a targeted comparison."
         )
         return
 
-    # ── Compare: run now ──
-    if data == "compare_now":
-        await query.edit_message_text("⏳  Comparing resumes...")
+    # ── Compare: run now (2 or multiple resumes) ──
+    if data in ("compare_now", "compare_multi_now"):
+        total = session.resume_count()
+        if total < 2:
+            await query.message.reply_text("⚠️  Please provide at least 2 resumes to compare.")
+            return
+        session.mode = SessionMode.COMPARE
+        session.state = SessionState.ANALYZING
+        if session.has_jd():
+            await query.edit_message_text(f"⏳  Ranking {total} candidates against the Job Description...")
+        else:
+            await query.edit_message_text(f"⏳  Comparing all {total} resumes across technical depth, caliber & impact...")
         await _run_analysis_from_callback(query, context, session)
+        return
+
+    # ── Add another resume prompt ──
+    if data == "prompt_add_resume":
+        next_num = session.resume_count() + 1
+        await query.message.reply_text(
+            f"📎  Please send resume #{next_num} (PDF or DOCX file), or paste candidate resume text."
+        )
+        return
+
+    # ── Clear candidate pool ──
+    if data == "clear_resumes":
+        session.reset()
+        await query.edit_message_text(
+            "🗑️  Candidate pool and session cleared!\n\n"
+            "Send a new resume file or use /start to begin fresh."
+        )
         return
 
     # ── Full Report button ──
@@ -475,6 +947,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text(text=page_text, reply_markup=keyboard)
         else:
             await query.message.reply_text("ℹ️  No additional details available.")
+        return
+
+    # ── Courses & Links button ──
+    if data == "show_courses":
+        if not session.last_analysis:
+            await query.message.reply_text("ℹ️  No active analysis found. Start with /analyze.")
+            return
+
+        learning = session.last_analysis.get("learning_recommendations", [])
+        if not learning:
+            await query.message.reply_text("ℹ️  No specific course recommendations found for this analysis.")
+            return
+
+        lines = [
+            "🎓  RECOMMENDED UPSKILLING COURSES & DIRECT LINKS",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+        ]
+        for i, rec in enumerate(learning, 1):
+            if isinstance(rec, dict):
+                skill = rec.get("skill", "")
+                priority = rec.get("priority", "medium")
+                course_name = rec.get("course_name", "")
+                platform = rec.get("platform", "")
+                url = rec.get("url", "")
+                reason = rec.get("reason", "")
+                emoji = priority_emoji(priority)
+
+                lines.append(f"  {i}. {emoji} {skill} [{priority.upper()}]")
+                if reason:
+                    lines.append(f"     📌 {reason}")
+                if course_name:
+                    plat_str = f" • {platform}" if platform else ""
+                    lines.append(f"     🎓 Course: {course_name}{plat_str}")
+                if url:
+                    lines.append(f"     🔗 Link: {url}")
+                lines.append("")
+            else:
+                lines.append(f"  {i}. • {rec}")
+                lines.append("")
+
+        lines.append("💡  Click the links above to enroll and bridge your skill gaps!")
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("💡  How to Boost Score?", callback_data="quick_improve"),
+                InlineKeyboardButton("🎯  Interview Questions", callback_data="quick_interview"),
+            ],
+            [InlineKeyboardButton("🔄  New Analysis", callback_data="new_analysis_prompt")],
+        ])
+        await query.message.reply_text("\n".join(lines), reply_markup=keyboard)
+        return
+
+    # ── Quick Score Improvement Tips ──
+    if data == "quick_improve":
+        if not session.last_analysis:
+            await query.message.reply_text("ℹ️  No active analysis found. Start with /analyze.")
+            return
+        await query.message.reply_text("⏳  Analyzing your resume for the highest-impact score improvements...")
+        await _run_follow_up(
+            query.message.chat_id,
+            context,
+            session,
+            "As a world-class technical recruiter and hiring manager, give me the 3 highest-leverage, specific adjustments I can make to my resume to maximize my ATS score and match this exact job. Include exact bullet point rewrites tailored to my background.",
+        )
+        return
+
+    # ── Quick Interview Prep Questions ──
+    if data == "quick_interview":
+        if not session.last_analysis:
+            await query.message.reply_text("ℹ️  No active analysis found. Start with /analyze.")
+            return
+        await query.message.reply_text("⏳  Formulating the toughest interview questions based on your skill gaps...")
+        await _run_follow_up(
+            query.message.chat_id,
+            context,
+            session,
+            "Based on the gaps between my resume and this job description, what are the top 5 technical and behavioral interview questions the hiring manager will grill me on, and what key points should I highlight to prove competence?",
+        )
         return
 
     # ── New Analysis prompt ──
@@ -535,6 +1085,7 @@ async def _run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, sess
             resume_a_text=session.resume_a_text,
             resume_b_text=session.resume_b_text,
             jd_text=session.jd_text,
+            resumes=session.resumes,
         )
 
         result = await analyze(SYSTEM_PROMPT, user_message)
@@ -573,6 +1124,7 @@ async def _run_analysis_from_callback(query, context, session) -> None:
             resume_a_text=session.resume_a_text,
             resume_b_text=session.resume_b_text,
             jd_text=session.jd_text,
+            resumes=session.resumes,
         )
 
         result = await analyze(SYSTEM_PROMPT, user_message)
@@ -591,8 +1143,10 @@ async def _run_analysis_from_callback(query, context, session) -> None:
         )
 
 
-async def _run_follow_up(update, context, session, question: str) -> None:
-    """Follow-up questions are free — no rate limit."""
+async def _run_follow_up(target, context, session, question: str) -> None:
+    """Follow-up questions with high-IQ career coach intelligence."""
+    chat_id = target.effective_chat.id if hasattr(target, "effective_chat") else target
+
     try:
         user_message = build_user_message(
             resume_a_text=session.resume_a_text,
@@ -602,25 +1156,25 @@ async def _run_follow_up(update, context, session, question: str) -> None:
         )
 
         result = await analyze(SYSTEM_PROMPT, user_message)
-        session.last_analysis = result
-
+        # Preserve original session.last_analysis so full context is retained for subsequent questions!
         formatted = format_response(result)
-        await _send_result(update.effective_chat.id, formatted, context)
+        await _send_follow_up_result(chat_id, formatted, context)
 
     except Exception as e:
         logger.error(f"Follow-up failed: {e}", exc_info=True)
-        await update.effective_chat.send_message(
+        await context.bot.send_message(
+            chat_id,
             f"❌  Couldn't process your question.\n\n"
             f"Error: {str(e)[:200]}"
         )
 
 
 # =============================================================================
-# Result Sending (Summary + Full Report button)
+# Result Sending (Summary + Interactive Buttons)
 # =============================================================================
 
 async def _send_result(chat_id: int, formatted: dict, context) -> None:
-    """Send the summary card, then offer a Full Report button if detail pages exist."""
+    """Send the summary card, then offer interactive action buttons."""
     summary = formatted.get("summary", "No results.")
     full_pages = formatted.get("full_report", [])
 
@@ -633,23 +1187,54 @@ async def _send_result(chat_id: int, formatted: dict, context) -> None:
     for part in summary_parts:
         await context.bot.send_message(chat_id, part)
 
-    # Show action buttons
+    # Show rich action buttons
     buttons = []
-
+    row1 = []
     if full_pages:
-        buttons.append([
-            InlineKeyboardButton("📋  Full Report", callback_data="full_report")
-        ])
+        row1.append(InlineKeyboardButton("📋  Full Report", callback_data="full_report"))
+    row1.append(InlineKeyboardButton("🎓  Courses & Links", callback_data="show_courses"))
+    buttons.append(row1)
+
+    buttons.append([
+        InlineKeyboardButton("💡  How to Boost Score?", callback_data="quick_improve"),
+        InlineKeyboardButton("🎯  Interview Questions", callback_data="quick_interview"),
+    ])
 
     buttons.append([
         InlineKeyboardButton("🔄  New Analysis", callback_data="new_analysis_prompt")
     ])
 
-    remaining = "💬  Ask follow-up questions anytime — they're free!"
+    guidance = "💬  Tap any button above or ask any follow-up question below!"
 
     await context.bot.send_message(
         chat_id,
-        remaining,
+        guidance,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _send_follow_up_result(chat_id: int, formatted: dict, context) -> None:
+    """Send career coach insights with clean spacing and interactive follow-up buttons."""
+    summary = formatted.get("summary", "No insights available.")
+    pages = split_into_pages(summary)
+
+    for page in pages:
+        await context.bot.send_message(chat_id, page)
+
+    buttons = [
+        [
+            InlineKeyboardButton("💡  How to Boost Score?", callback_data="quick_improve"),
+            InlineKeyboardButton("🎯  Interview Questions", callback_data="quick_interview"),
+        ],
+        [
+            InlineKeyboardButton("🎓  Courses & Links", callback_data="show_courses"),
+            InlineKeyboardButton("🔄  New Analysis", callback_data="new_analysis_prompt"),
+        ],
+    ]
+
+    await context.bot.send_message(
+        chat_id,
+        "💬  Ask another question anytime, or choose a next step above!",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 

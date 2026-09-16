@@ -1,22 +1,24 @@
 """
 AI Engine for CareerMatch AI bot.
-Handles communication with the TokenRouter API using the OpenAI SDK.
+Handles communication with Groq or OpenAI-compatible APIs.
 """
 
 import logging
 import asyncio
-from openai import AsyncOpenAI
-from config import AI_BASE_URL, TOKENROUTER_API_KEY, AI_MODEL, AI_TIMEOUT, AI_MAX_RETRIES
+from config import AI_PROVIDER, AI_API_KEY, AI_BASE_URL, AI_MODEL, AI_TIMEOUT, AI_MAX_RETRIES
 from utils import extract_json_from_text
 
 logger = logging.getLogger(__name__)
 
-# Initialize the async OpenAI client with TokenRouter base URL
-_client = AsyncOpenAI(
-    base_url=AI_BASE_URL,
-    api_key=TOKENROUTER_API_KEY,
-    timeout=AI_TIMEOUT,
-)
+# Initialize appropriate client
+if AI_PROVIDER == "groq":
+    from groq import AsyncGroq
+    _client = AsyncGroq(api_key=AI_API_KEY, timeout=AI_TIMEOUT)
+    logger.info(f"Initialized AsyncGroq client with model {AI_MODEL}")
+else:
+    from openai import AsyncOpenAI
+    _client = AsyncOpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY, timeout=AI_TIMEOUT)
+    logger.info(f"Initialized AsyncOpenAI client ({AI_BASE_URL}) with model {AI_MODEL}")
 
 
 async def analyze(system_prompt: str, user_message: str) -> dict:
@@ -43,26 +45,19 @@ async def analyze(system_prompt: str, user_message: str) -> dict:
 
     for attempt in range(1, AI_MAX_RETRIES + 1):
         try:
-            logger.info(f"AI API call attempt {attempt}/{AI_MAX_RETRIES}")
+            logger.info(f"AI API call attempt {attempt}/{AI_MAX_RETRIES} using {AI_MODEL} on {AI_PROVIDER}")
 
-            # Use streaming to collect the response
-            content_parts = []
-            stream = await _client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                stream=True,
-                stream_options={"include_usage": True},
-                temperature=0.3,  # Lower temperature for more consistent JSON
-                extra_body={},
-            )
+            # Request JSON output
+            create_kwargs = {
+                "model": AI_MODEL,
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": 2500,
+                "response_format": {"type": "json_object"},
+            }
 
-            async for chunk in stream:
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta and delta.content:
-                        content_parts.append(delta.content)
-
-            full_content = "".join(content_parts)
+            resp = await _client.chat.completions.create(**create_kwargs)
+            full_content = resp.choices[0].message.content or ""
 
             if not full_content.strip():
                 raise ValueError("AI returned an empty response.")
@@ -94,8 +89,7 @@ async def analyze(system_prompt: str, user_message: str) -> dict:
             last_error = e
             logger.warning(f"Attempt {attempt} failed (parse error): {e}")
             if attempt < AI_MAX_RETRIES:
-                await asyncio.sleep(2)
-                # On retry, add a reminder to return valid JSON
+                await asyncio.sleep(1)
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
@@ -103,8 +97,7 @@ async def analyze(system_prompt: str, user_message: str) -> dict:
                         "role": "user",
                         "content": (
                             "IMPORTANT: Your previous response was not valid JSON. "
-                            "Return ONLY a valid JSON object with no markdown, "
-                            "no code fences, and no text outside the JSON."
+                            "Return ONLY a valid JSON object matching the requested schema."
                         ),
                     },
                 ]
@@ -113,31 +106,8 @@ async def analyze(system_prompt: str, user_message: str) -> dict:
             last_error = e
             logger.error(f"Attempt {attempt} failed (API error): {e}")
             if attempt < AI_MAX_RETRIES:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
     raise Exception(
         f"AI analysis failed after {AI_MAX_RETRIES} attempts. Last error: {last_error}"
     )
-
-
-async def health_check() -> bool:
-    """Quick health check to verify the API connection."""
-    try:
-        content_parts = []
-        stream = await _client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[
-                {"role": "user", "content": 'Respond with exactly: {"status":"ok"}'},
-            ],
-            stream=True,
-            extra_body={},
-        )
-        async for chunk in stream:
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    content_parts.append(delta.content)
-        return bool(content_parts)
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return False

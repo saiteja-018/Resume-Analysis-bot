@@ -33,23 +33,77 @@ class SessionMode(Enum):
 
 
 @dataclass
+class ResumeItem:
+    """Represents a single resume document in a multi-resume session."""
+    index: int
+    name: str  # e.g., "Resume 1 (john_doe.pdf)"
+    filename: str
+    text: str
+
+
+@dataclass
 class UserSession:
     """Holds all data for a single user's interaction session."""
     user_id: int
     state: SessionState = SessionState.IDLE
     mode: SessionMode = SessionMode.NONE
-    resume_a_text: str | None = None
-    resume_b_text: str | None = None
+    resumes: list[ResumeItem] = field(default_factory=list)
     jd_text: str | None = None
     last_analysis: dict | None = None
     last_updated: float = field(default_factory=time.time)
 
+    # ── Backward compatibility properties ──
+    @property
+    def resume_a_text(self) -> str | None:
+        return self.resumes[0].text if len(self.resumes) > 0 else None
+
+    @resume_a_text.setter
+    def resume_a_text(self, val: str | None):
+        if val is None:
+            if self.resumes:
+                self.resumes.pop(0)
+        elif self.resumes:
+            self.resumes[0].text = val
+        else:
+            self.resumes.append(ResumeItem(index=1, name="Resume 1", filename="resume_1", text=val))
+
+    @property
+    def resume_b_text(self) -> str | None:
+        return self.resumes[1].text if len(self.resumes) > 1 else None
+
+    @resume_b_text.setter
+    def resume_b_text(self, val: str | None):
+        if val is None:
+            if len(self.resumes) > 1:
+                self.resumes.pop(1)
+        elif len(self.resumes) > 1:
+            self.resumes[1].text = val
+        else:
+            self.resumes.append(ResumeItem(index=2, name="Resume 2", filename="resume_2", text=val))
+
+    def add_resume(self, text: str, filename: str = "") -> ResumeItem:
+        """Add a resume to the session's candidate pool."""
+        idx = len(self.resumes) + 1
+        name = f"Resume {idx}"
+        if filename:
+            name += f" ({filename})"
+        item = ResumeItem(index=idx, name=name, filename=filename or f"resume_{idx}", text=text)
+        self.resumes.append(item)
+        self.touch()
+        return item
+
+    def resume_count(self) -> int:
+        return len(self.resumes)
+
+    def clear_resumes(self):
+        self.resumes.clear()
+        self.touch()
+
     def reset(self):
-        """Clear all session data and return to idle."""
+        """Clear all session inputs and return to idle."""
         self.state = SessionState.IDLE
         self.mode = SessionMode.NONE
-        self.resume_a_text = None
-        self.resume_b_text = None
+        self.resumes.clear()
         self.jd_text = None
         # Keep last_analysis for follow-up questions
         self.last_updated = time.time()
@@ -68,7 +122,7 @@ class UserSession:
         return (time.time() - self.last_updated) > SESSION_TIMEOUT
 
     def has_resume(self) -> bool:
-        return bool(self.resume_a_text)
+        return len(self.resumes) > 0
 
     def has_jd(self) -> bool:
         return bool(self.jd_text)
@@ -79,10 +133,12 @@ class UserSession:
     def get_status_summary(self) -> str:
         """Return a human-readable summary of the current session state."""
         parts = []
-        if self.resume_a_text:
-            parts.append(f"Resume A: {len(self.resume_a_text)} chars")
-        if self.resume_b_text:
-            parts.append(f"Resume B: {len(self.resume_b_text)} chars")
+        if self.resumes:
+            parts.append(f"Resumes loaded: {len(self.resumes)}")
+            for r in self.resumes[:5]:
+                parts.append(f"  • {r.name}: {len(r.text)} chars")
+            if len(self.resumes) > 5:
+                parts.append(f"  ...and {len(self.resumes) - 5} more")
         if self.jd_text:
             parts.append(f"Job Description: {len(self.jd_text)} chars")
         if self.last_analysis:

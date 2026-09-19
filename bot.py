@@ -1308,7 +1308,7 @@ async def set_bot_commands(app) -> None:
 
 
 # =============================================================================
-# Render Web Service: Concurrent HTTP Health Server & Application Lifecycle
+# Render Web Service: Concurrent HTTP Health Server & Webhook Lifecycle
 # =============================================================================
 
 import asyncio
@@ -1340,73 +1340,32 @@ async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-async def _post_init(app: Application) -> None:
-    """
-    Lifecycle hook executed after application initialization, before polling starts.
-    1. Starts concurrent HTTP health server on 0.0.0.0:$PORT
-    2. Resolves any Telegram webhook conflicts (ensures getUpdates works smoothly)
-    3. Sets bot command menu
-    4. Attaches lifecycle logging hooks for polling start and graceful shutdown
-    """
-    port = int(os.environ.get("PORT", "10000"))
-
-    # 1. Start HTTP health server concurrently on the running event loop
-    health_app = web.Application()
-    health_app.router.add_get("/", _handle_root)
-    health_app.router.add_get("/health", _handle_health)
-
-    runner = web.AppRunner(health_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    app.bot_data["health_runner"] = runner
-    logger.info("HTTP server started on 0.0.0.0:%d", port)
-
-    # 2. Check for and eliminate webhook conflicts so polling never fails with 409 Conflict
-    try:
-        webhook_info = await app.bot.get_webhook_info()
-        if webhook_info.url:
-            logger.warning("Active webhook detected. Removing webhook to prevent conflict with polling...")
-            await app.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Existing webhook removed successfully.")
-        else:
-            logger.info("No active webhook conflict found.")
-    except Exception as exc:
-        logger.warning("Could not check/delete webhook (continuing startup): %s", exc)
-
-    # 3. Set bot command menu
-    await set_bot_commands(app)
-    logger.info("Telegram bot initialized.")
-
-
-async def _post_shutdown(app: Application) -> None:
-    """
-    Lifecycle hook executed during graceful shutdown.
-    Cleans up the concurrent HTTP health server.
-    """
-    runner = app.bot_data.get("health_runner")
-    if runner:
-        logger.info("Stopping HTTP server...")
-        await runner.cleanup()
-        logger.info("HTTP server stopped.")
-    logger.info("Graceful shutdown complete.")
-
-
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Catch and log all errors occurring during polling or update handling
+    Catch and log all errors occurring during update handling
     so errors are never silently swallowed.
     """
     err = context.error
     if isinstance(err, TelegramError):
-        logger.error("Telegram API/polling error encountered: %s", err, exc_info=err)
+        logger.error("Telegram API error encountered: %s", err, exc_info=err)
     else:
         logger.error("Unhandled exception during update processing: %s", err, exc_info=err)
 
 
-def main():
+async def main_async():
     validate_config()
-    logger.info("Starting CareerMatch AI bot...")
+    logger.info("Starting CareerMatch AI bot in webhook mode...")
+
+    port = int(os.environ.get("PORT", "10000"))
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    webhook_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+
+    if not render_url:
+        logger.error("RENDER_EXTERNAL_URL is not set in the environment! Cannot configure webhook.")
+        return
+
+    webhook_path = "/webhook"
+    webhook_url = f"{render_url.rstrip('/')}{webhook_path}"
 
     app = (
         ApplicationBuilder()
@@ -1419,28 +1378,8 @@ def main():
         .build()
     )
 
-    # Attach lifecycle logging hooks to updater start and stop
-    if app.updater:
-        orig_start_polling = app.updater.start_polling
-
-        async def _wrapped_start_polling(*args, **kwargs):
-            result = await orig_start_polling(*args, **kwargs)
-            logger.info("Telegram polling started.")
-            return result
-
-        app.updater.start_polling = lambda *a, **kw: _wrapped_start_polling(*a, **kw)
-
-        orig_stop = app.updater.stop
-
-        async def _wrapped_stop(*args, **kwargs):
-            logger.info("Shutdown signal received: stopping Telegram polling...")
-            result = await orig_stop(*args, **kwargs)
-            logger.info("Telegram polling stopped.")
-            return result
-
-        app.updater.stop = _wrapped_stop
-
     # Command handlers
+    await set_bot_commands(app)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
@@ -1449,32 +1388,99 @@ def main():
     app.add_handler(CommandHandler("jd", cmd_jd))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
-
-    # Document handler (PDF/DOCX uploads)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # Callback query handler (buttons)
     app.add_handler(CallbackQueryHandler(handle_callback))
-
-    # Text handler (JD text, follow-ups, greetings) — must be LAST
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Error handler for polling & update exceptions
     app.add_error_handler(global_error_handler)
 
-    # Lifecycle hooks: HTTP health server and clean shutdown
-    app.post_init = _post_init
-    app.post_shutdown = _post_shutdown
+    # Initialize Telegram app manually
+    await app.initialize()
+    await app.start()
+    logger.info("Telegram bot initialized.")
 
-    # The Telegram polling process IS the long-lived application lifecycle.
-    # run_polling() runs loop.run_forever() internally, handling SIGTERM/SIGINT
-    # natively and keeping the main process alive until Render terminates it.
-    logger.info("Starting Telegram long polling lifecycle...")
-    app.run_polling(
-        drop_pending_updates=True,
-        bootstrap_retries=5,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    # HTTP Webhook Handler
+    async def _handle_webhook(request: web.Request) -> web.Response:
+        """POST /webhook — Receives updates from Telegram."""
+        if webhook_secret:
+            secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if secret_header != webhook_secret:
+                logger.warning("Webhook authentication failed. Invalid secret token.")
+                return web.Response(status=403, text="Forbidden")
+        try:
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            await app.update_queue.put(update)
+            return web.Response(status=200, text="OK")
+        except Exception as e:
+            logger.error("Error processing webhook request: %s", e, exc_info=True)
+            return web.Response(status=500, text="Internal Server Error")
+
+    # Start HTTP health server & webhook concurrently
+    health_app = web.Application()
+    health_app.router.add_get("/", _handle_root)
+    health_app.router.add_get("/health", _handle_health)
+    health_app.router.add_post(webhook_path, _handle_webhook)
+
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("HTTP server: READY (Listening on 0.0.0.0:%d)", port)
+
+    # Configure Telegram webhook
+    try:
+        await app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=webhook_secret,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        logger.info("Telegram webhook: READY")
+        logger.info("Telegram webhook configured successfully. (URL: %s)", webhook_url)
+    except Exception as e:
+        logger.error("Failed to configure Telegram webhook: %s", e)
+
+    logger.info("GLM configuration: READY")
+
+    # Wait indefinitely until termination signal
+    stop_signal = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _signal_handler(*args):
+        logger.info("Shutdown signal received: stopping application gracefully...")
+        stop_signal.set()
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, _signal_handler)
+        loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+    except NotImplementedError:
+        pass  # Windows fallback
+
+    try:
+        await stop_signal.wait()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received.")
+
+    # Clean shutdown
+    logger.info("Stopping HTTP server...")
+    await runner.cleanup()
+    logger.info("HTTP server stopped.")
+    
+    logger.info("Stopping Telegram application...")
+    try:
+        await app.bot.delete_webhook()
+    except Exception:
+        pass
+    await app.stop()
+    await app.shutdown()
+    logger.info("Graceful shutdown complete.")
+
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

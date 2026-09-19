@@ -21,7 +21,7 @@ ENV PORT=10000
 EXPOSE ${PORT}
 
 # Health check using the actual HTTP endpoint
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Run the bot (unbuffered output for real-time logs)

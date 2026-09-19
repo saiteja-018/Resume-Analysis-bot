@@ -16,6 +16,7 @@ from telegram import (
     BotCommand,
 )
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -45,16 +46,23 @@ from utils import truncate_text, format_score_bar, score_emoji, priority_emoji, 
 # =============================================================================
 
 class _TokenRedactionFilter(logging.Filter):
-    """Redact Telegram bot tokens from log messages to prevent secret leaks."""
+    """Redact Telegram bot tokens and complete API URLs from log messages to prevent secret leaks."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN in record.getMessage():
-            record.msg = record.msg.replace(TELEGRAM_BOT_TOKEN, "***")
-            if isinstance(record.args, tuple):
-                record.args = tuple(
-                    str(a).replace(TELEGRAM_BOT_TOKEN, "***") if isinstance(a, str) else a
-                    for a in record.args
-                )
+        try:
+            msg = record.getMessage()
+            changed = False
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN in msg:
+                msg = msg.replace(TELEGRAM_BOT_TOKEN, "[REDACTED_BOT_TOKEN]")
+                changed = True
+            if "api.telegram.org" in msg:
+                msg = re.sub(r"(https?://api\.telegram\.org/bot)[^/\s]+", r"\1[REDACTED_BOT_TOKEN]", msg)
+                changed = True
+            if changed:
+                record.msg = msg
+                record.args = ()
+        except Exception:
+            pass
         return True
 
 
@@ -63,8 +71,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# Apply token redaction to the root logger so ALL loggers inherit it
-logging.getLogger().addFilter(_TokenRedactionFilter())
+# Apply token redaction to the root logger and all handlers
+_redaction_filter = _TokenRedactionFilter()
+logging.getLogger().addFilter(_redaction_filter)
+for _h in logging.root.handlers:
+    _h.addFilter(_redaction_filter)
 
 # Suppress noisy httpx request logs (they contain token URLs)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1296,60 +1307,15 @@ async def set_bot_commands(app) -> None:
     await app.bot.set_my_commands(commands)
 
 
-def main():
-    validate_config()
-    logger.info("Starting CareerMatch AI bot...")
-
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .pool_timeout(30.0)
-        .connection_pool_size(8)
-        .build()
-    )
-
-    # Command handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("review", cmd_review))
-    app.add_handler(CommandHandler("compare", cmd_compare))
-    app.add_handler(CommandHandler("jd", cmd_jd))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("status", cmd_status))
-
-    # Document handler (PDF/DOCX uploads)
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # Callback query handler (buttons)
-    app.add_handler(CallbackQueryHandler(handle_callback))
-
-    # Text handler (JD text, follow-ups, greetings) — must be LAST
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Post-init: set bot command menu
-    app.post_init = set_bot_commands
-
-    # Run with retries for unstable networks
-    logger.info("Bot is running! Press Ctrl+C to stop.")
-    app.run_polling(
-        drop_pending_updates=True,
-        bootstrap_retries=5,
-        allowed_updates=Update.ALL_TYPES,
-    )
-
-
 # =============================================================================
-# Render Web Service: Lightweight HTTP Health Server
+# Render Web Service: Concurrent HTTP Health Server & Application Lifecycle
 # =============================================================================
 
 import asyncio
 import signal
 import time
 from aiohttp import web
+from telegram.error import TelegramError
 
 _bot_start_time = time.time()
 
@@ -1374,8 +1340,17 @@ async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-async def _run_health_server(port: int) -> web.AppRunner:
-    """Start the aiohttp health server on 0.0.0.0:PORT."""
+async def _post_init(app: Application) -> None:
+    """
+    Lifecycle hook executed after application initialization, before polling starts.
+    1. Starts concurrent HTTP health server on 0.0.0.0:$PORT
+    2. Resolves any Telegram webhook conflicts (ensures getUpdates works smoothly)
+    3. Sets bot command menu
+    4. Attaches lifecycle logging hooks for polling start and graceful shutdown
+    """
+    port = int(os.environ.get("PORT", "10000"))
+
+    # 1. Start HTTP health server concurrently on the running event loop
     health_app = web.Application()
     health_app.router.add_get("/", _handle_root)
     health_app.router.add_get("/health", _handle_health)
@@ -1384,22 +1359,56 @@ async def _run_health_server(port: int) -> web.AppRunner:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Health server listening on 0.0.0.0:{port}")
-    return runner
+    app.bot_data["health_runner"] = runner
+    logger.info("HTTP server started on 0.0.0.0:%d", port)
+
+    # 2. Check for and eliminate webhook conflicts so polling never fails with 409 Conflict
+    try:
+        webhook_info = await app.bot.get_webhook_info()
+        if webhook_info.url:
+            logger.warning("Active webhook detected. Removing webhook to prevent conflict with polling...")
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Existing webhook removed successfully.")
+        else:
+            logger.info("No active webhook conflict found.")
+    except Exception as exc:
+        logger.warning("Could not check/delete webhook (continuing startup): %s", exc)
+
+    # 3. Set bot command menu
+    await set_bot_commands(app)
+    logger.info("Telegram bot initialized.")
 
 
-async def _run_with_health_server():
+async def _post_shutdown(app: Application) -> None:
     """
-    Run both the Telegram bot (long polling) and the HTTP health server
-    concurrently. Gracefully shuts down on SIGTERM/SIGINT.
+    Lifecycle hook executed during graceful shutdown.
+    Cleans up the concurrent HTTP health server.
     """
+    runner = app.bot_data.get("health_runner")
+    if runner:
+        logger.info("Stopping HTTP server...")
+        await runner.cleanup()
+        logger.info("HTTP server stopped.")
+    logger.info("Graceful shutdown complete.")
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Catch and log all errors occurring during polling or update handling
+    so errors are never silently swallowed.
+    """
+    err = context.error
+    if isinstance(err, TelegramError):
+        logger.error("Telegram API/polling error encountered: %s", err, exc_info=err)
+    else:
+        logger.error("Unhandled exception during update processing: %s", err, exc_info=err)
+
+
+def main():
     validate_config()
-    logger.info("Starting CareerMatch AI bot (Render mode)...")
+    logger.info("Starting CareerMatch AI bot...")
 
-    port = int(os.environ.get("PORT", "10000"))
-
-    # Build the Telegram application
-    tg_app = (
+    app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
         .connect_timeout(30.0)
@@ -1410,71 +1419,65 @@ async def _run_with_health_server():
         .build()
     )
 
-    # Register all handlers (identical to main())
-    tg_app.add_handler(CommandHandler("start", cmd_start))
-    tg_app.add_handler(CommandHandler("help", cmd_help))
-    tg_app.add_handler(CommandHandler("analyze", cmd_analyze))
-    tg_app.add_handler(CommandHandler("review", cmd_review))
-    tg_app.add_handler(CommandHandler("compare", cmd_compare))
-    tg_app.add_handler(CommandHandler("jd", cmd_jd))
-    tg_app.add_handler(CommandHandler("reset", cmd_reset))
-    tg_app.add_handler(CommandHandler("status", cmd_status))
-    tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    tg_app.add_handler(CallbackQueryHandler(handle_callback))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    tg_app.post_init = set_bot_commands
+    # Attach lifecycle logging hooks to updater start and stop
+    if app.updater:
+        orig_start_polling = app.updater.start_polling
 
-    # Start health server
-    runner = await _run_health_server(port)
+        async def _wrapped_start_polling(*args, **kwargs):
+            result = await orig_start_polling(*args, **kwargs)
+            logger.info("Telegram polling started.")
+            return result
 
-    # Graceful shutdown event
-    stop_event = asyncio.Event()
+        app.updater.start_polling = lambda *a, **kw: _wrapped_start_polling(*a, **kw)
 
-    loop = asyncio.get_running_loop()
+        orig_stop = app.updater.stop
 
-    def _signal_handler():
-        logger.info("Received shutdown signal, stopping gracefully...")
-        stop_event.set()
+        async def _wrapped_stop(*args, **kwargs):
+            logger.info("Shutdown signal received: stopping Telegram polling...")
+            result = await orig_stop(*args, **kwargs)
+            logger.info("Telegram polling stopped.")
+            return result
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler
-            pass
+        app.updater.stop = _wrapped_stop
 
-    # Initialize and start Telegram polling manually (non-blocking)
-    await tg_app.initialize()
-    await tg_app.start()
+    # Command handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("compare", cmd_compare))
+    app.add_handler(CommandHandler("jd", cmd_jd))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("status", cmd_status))
 
-    updater = tg_app.updater
-    await updater.start_polling(
+    # Document handler (PDF/DOCX uploads)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Callback query handler (buttons)
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Text handler (JD text, follow-ups, greetings) — must be LAST
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Error handler for polling & update exceptions
+    app.add_error_handler(global_error_handler)
+
+    # Lifecycle hooks: HTTP health server and clean shutdown
+    app.post_init = _post_init
+    app.post_shutdown = _post_shutdown
+
+    # The Telegram polling process IS the long-lived application lifecycle.
+    # run_polling() runs loop.run_forever() internally, handling SIGTERM/SIGINT
+    # natively and keeping the main process alive until Render terminates it.
+    logger.info("Starting Telegram long polling lifecycle...")
+    app.run_polling(
         drop_pending_updates=True,
         bootstrap_retries=5,
         allowed_updates=Update.ALL_TYPES,
     )
-    logger.info("Telegram polling started. Bot is running!")
-
-    # Wait until shutdown signal
-    await stop_event.wait()
-
-    # Graceful cleanup
-    logger.info("Shutting down Telegram polling...")
-    await updater.stop()
-    await tg_app.stop()
-    await tg_app.shutdown()
-
-    logger.info("Shutting down health server...")
-    await runner.cleanup()
-
-    logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
-    # If PORT env var is set (Render Web Service), run with health server.
-    # Otherwise, run the original blocking polling (local development).
-    if os.environ.get("PORT"):
-        asyncio.run(_run_with_health_server())
-    else:
-        main()
+    main()
+
 

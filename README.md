@@ -101,6 +101,10 @@ docker-compose logs -f
 docker-compose down
 ```
 
+### 5. Deploy to Render (Free Tier)
+
+See the [Render Deployment](#-render-deployment) section below for full instructions.
+
 ---
 
 ## 📖 Bot Commands
@@ -181,6 +185,60 @@ The bot calculates an estimated ATS compatibility score using weighted categorie
 | 0–49 | ⛔ Poor match |
 
 > ⚠️ This is an **estimated** ATS compatibility score — not a real ATS score, hiring probability, or interview guarantee.
+
+---
+
+## 🚀 Render Deployment
+
+This bot is ready to deploy on **Render's free Web Service tier**. It runs a lightweight HTTP health server alongside Telegram long polling — no webhook conversion needed.
+
+### How It Works
+
+When the `PORT` environment variable is set (Render injects this automatically), the bot starts in **Render mode**:
+
+1. An `aiohttp` HTTP server binds to `0.0.0.0:$PORT`
+2. Telegram long polling runs concurrently in the same async event loop
+3. Graceful shutdown on `SIGTERM`/`SIGINT` (Render sends these)
+
+When `PORT` is **not set** (local development), the bot runs the original `run_polling()` — no HTTP server, no changes.
+
+### Render Dashboard Settings
+
+| Setting | Value |
+|---------|-------|
+| **Service Type** | Web Service |
+| **Environment** | Docker |
+| **Region** | Any (closest to your users) |
+| **Branch** | `main` |
+| **Build Command** | *(leave blank — Dockerfile handles it)* |
+| **Start Command** | *(leave blank — Dockerfile `CMD` handles it)* |
+| **Health Check Path** | `/health` |
+
+### Required Environment Variables
+
+Set these in **Render Dashboard → Environment**:
+
+| Variable | Value |
+|----------|-------|
+| `TELEGRAM_BOT_TOKEN` | Your bot token from @BotFather |
+| `GROQ_API_KEY` | Your Groq API key |
+| `PORT` | *(auto-injected by Render — do NOT set manually)* |
+
+> Optional: Set `AI_MODEL` to override the default model.
+
+### Health Endpoints
+
+| Endpoint | Response |
+|----------|----------|
+| `GET /` | `CareerMatch AI Bot\nStatus: running\nUptime: ...` |
+| `GET /health` | `{"status": "ok"}` |
+
+### Free Tier Notes
+
+- Render free tier spins down after 15 minutes of inactivity
+- The health check keeps the service alive during active use
+- First request after spin-down takes ~30 seconds to cold-start
+- Telegram polling automatically resumes after restart
 
 ---
 

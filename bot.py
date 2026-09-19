@@ -41,13 +41,34 @@ from rate_limiter import rate_limiter
 from utils import truncate_text, format_score_bar, score_emoji, priority_emoji, is_job_description_doc
 
 # =============================================================================
-# Logging
+# Logging (with token redaction for production safety)
 # =============================================================================
+
+class _TokenRedactionFilter(logging.Filter):
+    """Redact Telegram bot tokens from log messages to prevent secret leaks."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN in record.getMessage():
+            record.msg = record.msg.replace(TELEGRAM_BOT_TOKEN, "***")
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    str(a).replace(TELEGRAM_BOT_TOKEN, "***") if isinstance(a, str) else a
+                    for a in record.args
+                )
+        return True
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# Apply token redaction to the root logger so ALL loggers inherit it
+logging.getLogger().addFilter(_TokenRedactionFilter())
+
+# Suppress noisy httpx request logs (they contain token URLs)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1321,5 +1342,139 @@ def main():
     )
 
 
+# =============================================================================
+# Render Web Service: Lightweight HTTP Health Server
+# =============================================================================
+
+import asyncio
+import signal
+import time
+from aiohttp import web
+
+_bot_start_time = time.time()
+
+
+async def _handle_root(request: web.Request) -> web.Response:
+    """GET / — Bot status page."""
+    uptime = int(time.time() - _bot_start_time)
+    hours, remainder = divmod(uptime, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return web.Response(
+        text=(
+            f"CareerMatch AI Bot\n"
+            f"Status: running\n"
+            f"Uptime: {hours}h {minutes}m {seconds}s\n"
+        ),
+        content_type="text/plain",
+    )
+
+
+async def _handle_health(request: web.Request) -> web.Response:
+    """GET /health — JSON health check for Render."""
+    return web.json_response({"status": "ok"})
+
+
+async def _run_health_server(port: int) -> web.AppRunner:
+    """Start the aiohttp health server on 0.0.0.0:PORT."""
+    health_app = web.Application()
+    health_app.router.add_get("/", _handle_root)
+    health_app.router.add_get("/health", _handle_health)
+
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health server listening on 0.0.0.0:{port}")
+    return runner
+
+
+async def _run_with_health_server():
+    """
+    Run both the Telegram bot (long polling) and the HTTP health server
+    concurrently. Gracefully shuts down on SIGTERM/SIGINT.
+    """
+    validate_config()
+    logger.info("Starting CareerMatch AI bot (Render mode)...")
+
+    port = int(os.environ.get("PORT", "10000"))
+
+    # Build the Telegram application
+    tg_app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .connection_pool_size(8)
+        .build()
+    )
+
+    # Register all handlers (identical to main())
+    tg_app.add_handler(CommandHandler("start", cmd_start))
+    tg_app.add_handler(CommandHandler("help", cmd_help))
+    tg_app.add_handler(CommandHandler("analyze", cmd_analyze))
+    tg_app.add_handler(CommandHandler("review", cmd_review))
+    tg_app.add_handler(CommandHandler("compare", cmd_compare))
+    tg_app.add_handler(CommandHandler("jd", cmd_jd))
+    tg_app.add_handler(CommandHandler("reset", cmd_reset))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    tg_app.add_handler(CallbackQueryHandler(handle_callback))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    tg_app.post_init = set_bot_commands
+
+    # Start health server
+    runner = await _run_health_server(port)
+
+    # Graceful shutdown event
+    stop_event = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+
+    def _signal_handler():
+        logger.info("Received shutdown signal, stopping gracefully...")
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
+    # Initialize and start Telegram polling manually (non-blocking)
+    await tg_app.initialize()
+    await tg_app.start()
+
+    updater = tg_app.updater
+    await updater.start_polling(
+        drop_pending_updates=True,
+        bootstrap_retries=5,
+        allowed_updates=Update.ALL_TYPES,
+    )
+    logger.info("Telegram polling started. Bot is running!")
+
+    # Wait until shutdown signal
+    await stop_event.wait()
+
+    # Graceful cleanup
+    logger.info("Shutting down Telegram polling...")
+    await updater.stop()
+    await tg_app.stop()
+    await tg_app.shutdown()
+
+    logger.info("Shutting down health server...")
+    await runner.cleanup()
+
+    logger.info("Shutdown complete.")
+
+
 if __name__ == "__main__":
-    main()
+    # If PORT env var is set (Render Web Service), run with health server.
+    # Otherwise, run the original blocking polling (local development).
+    if os.environ.get("PORT"):
+        asyncio.run(_run_with_health_server())
+    else:
+        main()
+

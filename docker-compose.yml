@@ -5,6 +5,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - PORT=10000
+    ports:
+      - "10000:10000"
     volumes:
       - ./downloads:/app/downloads
     logging:
